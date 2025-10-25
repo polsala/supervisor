@@ -675,8 +675,8 @@ class DefaultControllerPlugin(ControllerPluginBase):
             for name in names:
                 bad_name = True
                 
-                # Check if this is a hierarchical path (contains dots but no colon)
-                if '.' in name and ':' not in name:
+                # Check if this is a hierarchical path (contains dots but no colon) or glob
+                if ('.' in name and ':' not in name) or '*' in name:
                     # Try hierarchical resolution
                     try:
                         # Use the hierarchy to find matching processes
@@ -766,6 +766,7 @@ class DefaultControllerPlugin(ControllerPluginBase):
         self.ctl.output("status <gname>:*\tGet status for all "
                         "processes in a group")
         self.ctl.output("status <path>\t\tGet status for hierarchical group/program")
+        self.ctl.output("status <glob>\t\tGet status with glob patterns (e.g., frontend.*)")
         self.ctl.output("status <name> <name>\tGet status for multiple named "
                         "processes")
         self.ctl.output("status\t\t\tGet all process status info")
@@ -857,14 +858,14 @@ class DefaultControllerPlugin(ControllerPluginBase):
                 groups[group_name].append(info)
             
             for group_name in sorted(groups.keys()):
-                self.ctl.output(f"{group_name}")
+                self.ctl.output("{0}".format(group_name))
                 for info in groups[group_name]:
                     state = info['statename']
                     pid = info['pid'] if info['pid'] else ''
                     if state_filter and state != state_filter:
                         continue
-                    pid_str = f" pid {pid}" if pid else ""
-                    self.ctl.output(f"  └─ {info['name']:<20} {state:<12}{pid_str}")
+                    pid_str = " pid {0}".format(pid) if pid else ""
+                    self.ctl.output("  └─ {0:<20} {1:<12}{2}".format(info['name'], state, pid_str))
 
     def _display_tree(self, node_data, prefix="", is_last=True, depth=None, state_filter=None, current_depth=0):
         """Display tree structure with nice formatting."""
@@ -890,11 +891,11 @@ class DefaultControllerPlugin(ControllerPluginBase):
             pid = node_data.get('pid', '')
             if state_filter and state != state_filter:
                 return
-            pid_str = f" pid {pid}" if pid else ""
-            self.ctl.output(f"{prefix}{connector}{name:<20} {state:<12}{pid_str}")
+            pid_str = " pid {0}".format(pid) if pid else ""
+            self.ctl.output("{0}{1}{2:<20} {3:<12}{4}".format(prefix, connector, name, state, pid_str))
         else:
             # Group or MultiGroup
-            self.ctl.output(f"{prefix}{connector}{name}")
+            self.ctl.output("{0}{1}{2}".format(prefix, connector, name))
         
         # Prepare prefix for children
         if is_last:
@@ -956,16 +957,16 @@ class DefaultControllerPlugin(ControllerPluginBase):
                 self.ctl.set_exitstatus_from_xmlrpc_fault(result['status'], xmlrpc.Faults.ALREADY_STARTED)
         else:
             for name in names:
-                # Check if this is a hierarchical path (contains dots but no colon)
-                if '.' in name and ':' not in name:
+                # Check if this is a hierarchical path (contains dots but no colon) or glob
+                if ('.' in name and ':' not in name) or '*' in name:
                     # Try hierarchical control
                     try:
                         results = supervisor.controlByPath('start', [name])
                         for result in results:
                             if result.get('status') == 'success':
-                                self.ctl.output(f"{result['path']}: started")
+                                self.ctl.output("{0}: started".format(result['path']))
                             else:
-                                self.ctl.output(f"{result['path']}: ERROR ({result.get('error', 'unknown error')})")
+                                self.ctl.output("{0}: ERROR ({1})".format(result['path'], result.get('error', 'unknown error')))
                                 self.ctl.exitstatus = LSBInitExitStatuses.GENERIC
                     except (AttributeError, xmlrpclib.Fault):
                         # Fall back to traditional parsing
@@ -1008,6 +1009,7 @@ class DefaultControllerPlugin(ControllerPluginBase):
         self.ctl.output("start <name>\t\tStart a process")
         self.ctl.output("start <gname>:*\t\tStart all processes in a group")
         self.ctl.output("start <path>\t\tStart hierarchical group/program (e.g., prod.backend)")
+        self.ctl.output("start <glob>\t\tStart with glob patterns (e.g., frontend.*, prod.**)")
         self.ctl.output(
             "start <name> <name>\tStart multiple processes or groups")
         self.ctl.output("start all\t\tStart all processes")
@@ -1053,38 +1055,59 @@ class DefaultControllerPlugin(ControllerPluginBase):
                 self.ctl.set_exitstatus_from_xmlrpc_fault(result['status'], xmlrpc.Faults.NOT_RUNNING)
         else:
             for name in names:
-                group_name, process_name = split_namespec(name)
-                if process_name is None:
+                # Check if this is a hierarchical path (contains dots but no colon) or glob
+                if ('.' in name and ':' not in name) or '*' in name:
+                    # Try hierarchical control
                     try:
-                        results = supervisor.stopProcessGroup(group_name)
-
+                        results = supervisor.controlByPath('stop', [name])
                         for result in results:
-                            self.ctl.output(self._stopresult(result))
-                            self.ctl.set_exitstatus_from_xmlrpc_fault(result['status'], xmlrpc.Faults.NOT_RUNNING)
-                    except xmlrpclib.Fault as e:
-                        self.ctl.exitstatus = LSBInitExitStatuses.GENERIC
-                        if e.faultCode == xmlrpc.Faults.BAD_NAME:
-                            error = "%s: ERROR (no such group)" % group_name
-                            self.ctl.output(error)
-                        else:
-                            raise
+                            if result.get('status') == 'success':
+                                self.ctl.output("{0}: stopped".format(result['path']))
+                            else:
+                                self.ctl.output("{0}: ERROR ({1})".format(result['path'], result.get('error', 'unknown error')))
+                                self.ctl.exitstatus = LSBInitExitStatuses.GENERIC
+                    except (AttributeError, xmlrpclib.Fault):
+                        # Fall back to traditional parsing
+                        self._stop_traditional(supervisor, name)
                 else:
-                    try:
-                        supervisor.stopProcess(name)
-                    except xmlrpclib.Fault as e:
-                        error = {'status': e.faultCode,
-                                 'name': process_name,
-                                 'group': group_name,
-                                 'description':e.faultString}
-                        self.ctl.output(self._stopresult(error))
-                        self.ctl.set_exitstatus_from_xmlrpc_fault(error['status'], xmlrpc.Faults.NOT_RUNNING)
-                    else:
-                        name = make_namespec(group_name, process_name)
-                        self.ctl.output('%s: stopped' % name)
+                    self._stop_traditional(supervisor, name)
+
+    def _stop_traditional(self, supervisor, name):
+        """Traditional stop logic for backward compatibility."""
+        group_name, process_name = split_namespec(name)
+        if process_name is None:
+            try:
+                results = supervisor.stopProcessGroup(group_name)
+
+                for result in results:
+                    self.ctl.output(self._stopresult(result))
+                    self.ctl.set_exitstatus_from_xmlrpc_fault(result['status'], xmlrpc.Faults.NOT_RUNNING)
+            except xmlrpclib.Fault as e:
+                self.ctl.exitstatus = LSBInitExitStatuses.GENERIC
+                if e.faultCode == xmlrpc.Faults.BAD_NAME:
+                    error = "%s: ERROR (no such group)" % group_name
+                    self.ctl.output(error)
+                else:
+                    raise
+        else:
+            try:
+                supervisor.stopProcess(name)
+            except xmlrpclib.Fault as e:
+                error = {'status': e.faultCode,
+                         'name': process_name,
+                         'group': group_name,
+                         'description':e.faultString}
+                self.ctl.output(self._stopresult(error))
+                self.ctl.set_exitstatus_from_xmlrpc_fault(error['status'], xmlrpc.Faults.NOT_RUNNING)
+            else:
+                name_display = make_namespec(group_name, process_name)
+                self.ctl.output('%s: stopped' % name_display)
 
     def help_stop(self):
         self.ctl.output("stop <name>\t\tStop a process")
         self.ctl.output("stop <gname>:*\t\tStop all processes in a group")
+        self.ctl.output("stop <path>\t\tStop hierarchical group/program (e.g., prod.backend)")
+        self.ctl.output("stop <glob>\t\tStop with glob patterns (e.g., frontend.*, prod.**)")
         self.ctl.output("stop <name> <name>\tStop multiple processes or groups")
         self.ctl.output("stop all\t\tStop all processes")
 
@@ -1166,6 +1189,8 @@ class DefaultControllerPlugin(ControllerPluginBase):
     def help_restart(self):
         self.ctl.output("restart <name>\t\tRestart a process")
         self.ctl.output("restart <gname>:*\tRestart all processes in a group")
+        self.ctl.output("restart <path>\t\tRestart hierarchical group/program (e.g., prod.backend)")
+        self.ctl.output("restart <glob>\t\tRestart with glob patterns (e.g., frontend.*, prod.**)")
         self.ctl.output("restart <name> <name>\tRestart multiple processes or "
                      "groups")
         self.ctl.output("restart all\t\tRestart all processes")

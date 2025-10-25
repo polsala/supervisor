@@ -1015,11 +1015,11 @@ class SupervisorNamespaceRPCInterface:
                             elif action == 'restart':
                                 try:
                                     self.stopProcess(namespec)
-                                except:
+                                except Exception:
                                     pass  # Ignore if already stopped
                                 result = self.startProcess(namespec)
                             else:
-                                raise RPCError(Faults.UNKNOWN_METHOD, f'Unknown action: {action}')
+                                raise RPCError(Faults.UNKNOWN_METHOD, 'Unknown action: {0}'.format(action))
                             path_results.append({
                                 'path': node.get_path(),
                                 'name': node.name,
@@ -1063,11 +1063,11 @@ class SupervisorNamespaceRPCInterface:
                                 elif action == 'restart':
                                     try:
                                         self.stopProcess(namespec)
-                                    except:
+                                    except Exception:
                                         pass
                                     result = self.startProcess(namespec)
                                 else:
-                                    raise RPCError(Faults.UNKNOWN_METHOD, f'Unknown action: {action}')
+                                    raise RPCError(Faults.UNKNOWN_METHOD, 'Unknown action: {0}'.format(action))
                                     
                                 path_results.append({
                                     'path': program.get_path(),
