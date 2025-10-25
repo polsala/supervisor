@@ -936,6 +936,214 @@ class SupervisorNamespaceRPCInterface:
 
         return True
 
+    def getHierarchy(self):
+        """Get the hierarchical group structure.
+        
+        @return dict  Hierarchical structure as dictionary
+        """
+        if hasattr(self.supervisord.options, 'hierarchy_manager') and self.supervisord.options.hierarchy_manager:
+            hierarchy_dict = self.supervisord.options.hierarchy_manager.get_hierarchy_dict()
+            
+            # Enrich with current process state information
+            all_infos = self.getAllProcessInfo()
+            info_by_namespec = {}
+            for info in all_infos:
+                namespec = make_namespec(info['group'], info['name'])
+                info_by_namespec[namespec] = info
+                
+            def enrich_node(node):
+                if node.get('type') == 'ProgramNode':
+                    # Try to find matching process info
+                    path = node.get('path', '')
+                    namespec = path.replace('.', ':')  # Convert path to namespec
+                    if namespec in info_by_namespec:
+                        info = info_by_namespec[namespec]
+                        node['state'] = info['statename']
+                        node['pid'] = info['pid']
+                        node['description'] = info['description']
+                    else:
+                        # Try matching by just the program name
+                        program_name = node.get('name')
+                        for ns, info in info_by_namespec.items():
+                            if ns.endswith(':' + program_name) or ns == program_name:
+                                node['state'] = info['statename'] 
+                                node['pid'] = info['pid']
+                                node['description'] = info['description']
+                                break
+                
+                # Recursively enrich children
+                for child in node.get('children', {}).values():
+                    enrich_node(child)
+                    
+            enrich_node(hierarchy_dict)
+            return hierarchy_dict
+        else:
+            # Fall back to flat structure
+            return {"name": "<root>", "type": "RootNode", "path": "<root>", "children": {}}
+
+    def controlByPath(self, action, paths, recursive=True):
+        """Control processes/groups by hierarchical path.
+        
+        @param string action    Action to perform (start, stop, restart)
+        @param list paths       List of hierarchical paths
+        @param boolean recursive Whether to apply recursively
+        @return list            List of results per path
+        """
+        if not hasattr(self.supervisord.options, 'hierarchy_manager') or not self.supervisord.options.hierarchy_manager:
+            raise RPCError(Faults.UNKNOWN_METHOD, 'Hierarchical groups not configured')
+            
+        hierarchy_manager = self.supervisord.options.hierarchy_manager
+        results = []
+        
+        for path in paths:
+            try:
+                # Resolve path (may be glob)
+                nodes = hierarchy_manager.resolve_path(path)
+                if not isinstance(nodes, list):
+                    nodes = [nodes]
+                    
+                path_results = []
+                for node in nodes:
+                    if node.__class__.__name__ == 'ProgramNode':
+                        # Control individual program
+                        namespec = make_namespec(node.parent.get_path().replace('.', ':'), node.name)
+                        try:
+                            if action == 'start':
+                                result = self.startProcess(namespec)
+                            elif action == 'stop':
+                                result = self.stopProcess(namespec)
+                            elif action == 'restart':
+                                try:
+                                    self.stopProcess(namespec)
+                                except:
+                                    pass  # Ignore if already stopped
+                                result = self.startProcess(namespec)
+                            else:
+                                raise RPCError(Faults.UNKNOWN_METHOD, f'Unknown action: {action}')
+                            path_results.append({
+                                'path': node.get_path(),
+                                'name': node.name,
+                                'action': action,
+                                'status': 'success',
+                                'result': result
+                            })
+                        except Exception as e:
+                            path_results.append({
+                                'path': node.get_path(),
+                                'name': node.name, 
+                                'action': action,
+                                'status': 'error',
+                                'error': str(e)
+                            })
+                    else:
+                        # Control group - get all descendant programs
+                        if recursive:
+                            from supervisor.hierarchy import ProgramNode
+                            descendant_programs = list(node.iter_descendants(
+                                predicate=lambda n: isinstance(n, ProgramNode)))
+                        else:
+                            descendant_programs = [child for child in node.children.values() 
+                                                 if child.__class__.__name__ == 'ProgramNode']
+                        
+                        for program in descendant_programs:
+                            try:
+                                # Convert hierarchical path to namespec for existing RPC calls
+                                group_path = program.parent.get_path()
+                                if '.' in group_path:
+                                    # For hierarchical groups, use the leaf group name
+                                    group_name = group_path.split('.')[-1]
+                                else:
+                                    group_name = group_path
+                                namespec = make_namespec(group_name, program.name)
+                                
+                                if action == 'start':
+                                    result = self.startProcess(namespec)
+                                elif action == 'stop':
+                                    result = self.stopProcess(namespec)
+                                elif action == 'restart':
+                                    try:
+                                        self.stopProcess(namespec)
+                                    except:
+                                        pass
+                                    result = self.startProcess(namespec)
+                                else:
+                                    raise RPCError(Faults.UNKNOWN_METHOD, f'Unknown action: {action}')
+                                    
+                                path_results.append({
+                                    'path': program.get_path(),
+                                    'name': program.name,
+                                    'action': action,
+                                    'status': 'success',
+                                    'result': result
+                                })
+                            except Exception as e:
+                                path_results.append({
+                                    'path': program.get_path(),
+                                    'name': program.name,
+                                    'action': action,
+                                    'status': 'error',
+                                    'error': str(e)
+                                })
+                
+                results.extend(path_results)
+                
+            except Exception as e:
+                results.append({
+                    'path': path,
+                    'action': action,
+                    'status': 'error',
+                    'error': str(e)
+                })
+        
+        return results
+
+    def listPaths(self, kind='any'):
+        """List all paths in the hierarchy.
+        
+        @param string kind   Filter by node type: 'any', 'program', 'group', 'multigroup' 
+        @return list         List of paths
+        """
+        if not hasattr(self.supervisord.options, 'hierarchy_manager') or not self.supervisord.options.hierarchy_manager:
+            # Fall back to traditional group names
+            all_infos = self.getAllProcessInfo()
+            groups = set()
+            programs = []
+            for info in all_infos:
+                group_name = info['group']
+                groups.add(group_name)
+                program_name = info['name']
+                programs.append(make_namespec(group_name, program_name))
+            
+            if kind == 'group':
+                return list(groups)
+            elif kind == 'program':  
+                return programs
+            else:
+                return list(groups) + programs
+                
+        hierarchy_manager = self.supervisord.options.hierarchy_manager
+        paths = []
+        
+        def collect_paths(node):
+            path = node.get_path()
+            node_type = node.__class__.__name__
+            
+            if kind == 'any':
+                if path != '<root>':
+                    paths.append(path)
+            elif kind == 'program' and node_type == 'ProgramNode':
+                paths.append(path)
+            elif kind == 'group' and node_type in ('GroupNode', 'MultiGroupNode'):
+                paths.append(path)  
+            elif kind == 'multigroup' and node_type == 'MultiGroupNode':
+                paths.append(path)
+                
+            for child in node.children.values():
+                collect_paths(child)
+                
+        collect_paths(hierarchy_manager.root)
+        return paths
+
 def _total_seconds(timedelta):
     return ((timedelta.days * 86400 + timedelta.seconds) * 10**6 +
                 timedelta.microseconds) / 10**6
