@@ -43,7 +43,8 @@ class Node(object):
         """Add a child node."""
         if child.name in self.children:
             raise DuplicateNameError(
-                f"Child '{child.name}' already exists in '{self.get_path()}'")
+                "Child '{0}' already exists in '{1}'".format(
+                    child.name, self.get_path()))
         self.children[child.name] = child
         child.parent = self
         
@@ -60,7 +61,7 @@ class Node(object):
         """Get the full path from root to this node."""
         if self.parent is None or self.parent.name == '<root>':
             return self.name
-        return f"{self.parent.get_path()}.{self.name}"
+        return "%s.%s" % (self.parent.get_path(), self.name)
         
     def find_child(self, name):
         """Find a direct child by name."""
@@ -80,7 +81,11 @@ class Node(object):
                 yield descendant
                 
     def __repr__(self):
-        return f"<{self.__class__.__name__}(name='{self.name}', path='{self.get_path()}')>"
+        return "<{0}(name='{1}', path='{2}')>".format(
+            self.__class__.__name__,
+            self.name,
+            self.get_path(),
+        )
 
 
 class RootNode(Node):
@@ -134,8 +139,10 @@ class HierarchyManager(object):
             existing = parent.children[program_name]
             if not isinstance(existing, ProgramNode):
                 raise HierarchyError(
-                    f"Cannot add program '{program_name}' at '{path}': "
-                    f"name conflicts with existing {existing.__class__.__name__}")
+                    "Cannot add program '{0}' at '{1}': name conflicts with "
+                    "existing {2}".format(
+                        program_name, path, existing.__class__.__name__)
+                )
         
         program = ProgramNode(program_name, process_config, parent)
         parent.add_child(program)
@@ -156,8 +163,10 @@ class HierarchyManager(object):
                 return existing
             else:
                 raise HierarchyError(
-                    f"Cannot add group '{group_name}' at '{path}': "
-                    f"name conflicts with existing {existing.__class__.__name__}")
+                    "Cannot add group '{0}' at '{1}': name conflicts with "
+                    "existing {2}".format(
+                        group_name, path, existing.__class__.__name__)
+                )
         
         if is_multigroup:
             group = MultiGroupNode(group_name, parent)
@@ -189,7 +198,9 @@ class HierarchyManager(object):
         
         for part in parts:
             if part not in current.children:
-                raise PathError(f"Path '{path}' not found: no '{part}' in '{current.get_path()}'")
+                raise PathError(
+                    "Path '{0}' not found: no '{1}' in '{2}'".format(
+                        path, part, current.get_path()))
             current = current.children[part]
             
         return current
@@ -216,7 +227,7 @@ class HierarchyManager(object):
         # Split on ** to handle each part
         parts = pattern.split('**')
         if len(parts) != 2:
-            raise PathError(f"Invalid recursive glob pattern: '{pattern}'")
+            raise PathError("Invalid recursive glob pattern: '{0}'".format(pattern))
             
         prefix, suffix = parts
         results = []
@@ -354,6 +365,6 @@ def split_namespec(namespec):
 def make_namespec(group_path, program_name):
     """Create a namespec from group path and program name."""
     if group_path:
-        return f"{group_path}:{program_name}"
+        return "{0}:{1}".format(group_path, program_name)
     else:
         return program_name

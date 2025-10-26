@@ -935,7 +935,7 @@ class ServerOptions(Options):
                         if root_program:
                             # Add to the group
                             group_path = group_name if '.' not in group_name else group_name
-                            program_path = f"{group_path}.{program}"
+                            program_path = "%s.%s" % (group_path, program)
                             hierarchy_manager.add_program(program_path, root_program.process_config)
                     except Exception:
                         # Program might already be in a different location
@@ -954,7 +954,7 @@ class ServerOptions(Options):
                     try:
                         root_program = hierarchy_manager.root.remove_child(program)
                         if root_program:
-                            program_path = f"{group_name}.{program}"
+                            program_path = "%s.%s" % (group_name, program)
                             hierarchy_manager.add_program(program_path, root_program.process_config)
                     except Exception:
                         pass
