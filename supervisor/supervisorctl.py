@@ -43,6 +43,7 @@ from supervisor.options import split_namespec
 from supervisor import xmlrpc
 from supervisor import states
 from supervisor import http_client
+from supervisor import hierarchy
 
 class LSBInitExitStatuses:
     SUCCESS = 0
@@ -673,20 +674,38 @@ class DefaultControllerPlugin(ControllerPluginBase):
 
             for name in names:
                 bad_name = True
-                group_name, process_name = split_namespec(name)
+                
+                # Check if this is a hierarchical path (contains dots but no colon) or glob
+                if ('.' in name and ':' not in name) or '*' in name:
+                    # Try hierarchical resolution
+                    try:
+                        # Use the hierarchy to find matching processes
+                        hierarchy_data = supervisor.getHierarchy()
+                        matched_infos = self._find_hierarchical_matches(name, all_infos, hierarchy_data)
+                        if matched_infos:
+                            bad_name = False
+                            matching_infos.extend(matched_infos)
+                    except (AttributeError, xmlrpclib.Fault):
+                        # Fall back to traditional matching
+                        pass
+                
+                if bad_name:
+                    # Traditional namespec matching
+                    group_name, process_name = split_namespec(name)
 
-                for info in all_infos:
-                    matched = info['group'] == group_name
-                    if process_name is not None:
-                        matched = matched and info['name'] == process_name
+                    for info in all_infos:
+                        matched = info['group'] == group_name
+                        if process_name is not None:
+                            matched = matched and info['name'] == process_name
 
-                    if matched:
-                        bad_name = False
-                        matching_infos.append(info)
+                        if matched:
+                            bad_name = False
+                            matching_infos.append(info)
 
                 if bad_name:
-                    if process_name is None:
-                        msg = "%s: ERROR (no such group)" % group_name
+                    group_name, process_name = split_namespec(name) if ':' in name else (None, None)
+                    if process_name is None and not ('.' in name and ':' not in name):
+                        msg = "%s: ERROR (no such group)" % (group_name or name)
                     else:
                         msg = "%s: ERROR (no such process)" % name
                     self.ctl.output(msg)
@@ -694,13 +713,60 @@ class DefaultControllerPlugin(ControllerPluginBase):
         self._show_statuses(matching_infos)
 
         for info in matching_infos:
-            if info['state'] in states.STOPPED_STATES:
+            if info['statename'] in states.STOPPED_STATES:
                 self.ctl.exitstatus = LSBStatusExitStatuses.NOT_RUNNING
+
+    def _find_hierarchical_matches(self, path, all_infos, hierarchy_data):
+        """Find process infos that match a hierarchical path."""
+        matches = []
+        
+        def find_in_node(node, target_path):
+            node_path = node.get('path', '')
+            if node_path == '<root>':
+                node_path = ''
+            
+            # Check for exact path match or path prefix match
+            if target_path == node_path or (node_path and target_path.startswith(node_path + '.')):
+                # If this is a program node, find matching process info
+                if node.get('type') == 'ProgramNode':
+                    program_name = node.get('name')
+                    # Find the process info for this program
+                    for info in all_infos:
+                        if info['name'] == program_name:
+                            # Check if the full hierarchical path matches
+                            if target_path == node_path:
+                                matches.append(info)
+                            break
+                else:
+                    # For groups, check if we match the group path exactly
+                    if target_path == node_path:
+                        # Add all descendant programs
+                        def add_descendants(n):
+                            if n.get('type') == 'ProgramNode':
+                                program_name = n.get('name')
+                                for info in all_infos:
+                                    if info['name'] == program_name:
+                                        matches.append(info)
+                                        break
+                            for child in n.get('children', {}).values():
+                                add_descendants(child)
+                        
+                        add_descendants(node)
+                        return
+            
+            # Recursively search children
+            for child in node.get('children', {}).values():
+                find_in_node(child, target_path)
+        
+        find_in_node(hierarchy_data, path)
+        return matches
 
     def help_status(self):
         self.ctl.output("status <name>\t\tGet status for a single process")
         self.ctl.output("status <gname>:*\tGet status for all "
                         "processes in a group")
+        self.ctl.output("status <path>\t\tGet status for hierarchical group/program")
+        self.ctl.output("status <glob>\t\tGet status with glob patterns (e.g., frontend.*)")
         self.ctl.output("status <name> <name>\tGet status for multiple named "
                         "processes")
         self.ctl.output("status\t\t\tGet all process status info")
@@ -738,6 +804,117 @@ class DefaultControllerPlugin(ControllerPluginBase):
             "child process by name.")
         self.ctl.output("pid all\t\t\tGet the PID of every child "
             "process, one per line.")
+
+    def do_groups(self, arg):
+        """Display hierarchical group structure."""
+        if not self.ctl.upcheck():
+            return
+
+        supervisor = self.ctl.get_supervisor()
+        
+        # Parse arguments
+        args = arg.split()
+        show_json = '--json' in args
+        depth = None
+        state_filter = None
+        
+        i = 0
+        while i < len(args):
+            if args[i] == '--depth' and i + 1 < len(args):
+                try:
+                    depth = int(args[i + 1])
+                    i += 2
+                except ValueError:
+                    self.ctl.output("Error: --depth requires an integer argument")
+                    return
+            elif args[i] == '--state' and i + 1 < len(args):
+                state_filter = args[i + 1].upper()
+                i += 2
+            elif args[i] == '--json':
+                i += 1
+            else:
+                # Ignore unknown args for now
+                i += 1
+
+        try:
+            # Try to get hierarchy from server
+            hierarchy_data = supervisor.getHierarchy()
+            if show_json:
+                import json
+                self.ctl.output(json.dumps(hierarchy_data, indent=2))
+            else:
+                self._display_tree(hierarchy_data, depth=depth, state_filter=state_filter)
+        except (AttributeError, xmlrpclib.Fault):
+            # Fall back to traditional flat display
+            self.ctl.output("Hierarchical groups not supported - showing flat structure:")
+            all_infos = supervisor.getAllProcessInfo()
+            
+            # Group by group name
+            groups = {}
+            for info in all_infos:
+                group_name = info['group']
+                if group_name not in groups:
+                    groups[group_name] = []
+                groups[group_name].append(info)
+            
+            for group_name in sorted(groups.keys()):
+                self.ctl.output("{0}".format(group_name))
+                for info in groups[group_name]:
+                    state = info['statename']
+                    pid = info['pid'] if info['pid'] else ''
+                    if state_filter and state != state_filter:
+                        continue
+                    pid_str = " pid {0}".format(pid) if pid else ""
+                    self.ctl.output("  └─ {0:<20} {1:<12}{2}".format(info['name'], state, pid_str))
+
+    def _display_tree(self, node_data, prefix="", is_last=True, depth=None, state_filter=None, current_depth=0):
+        """Display tree structure with nice formatting."""
+        if depth is not None and current_depth >= depth:
+            return
+            
+        name = node_data.get('name', '')
+        node_type = node_data.get('type', '')
+        children = node_data.get('children', {})
+        
+        if name == '<root>':
+            # Don't show the root node
+            for child_name in sorted(children.keys()):
+                child_data = children[child_name]
+                is_last_child = child_name == sorted(children.keys())[-1]
+                self._display_tree(child_data, "", is_last_child, depth, state_filter, current_depth)
+            return
+            
+        # Format the node display
+        connector = "└─ " if is_last else "├─ "
+        if node_type == 'ProgramNode':
+            state = node_data.get('state', 'UNKNOWN')
+            pid = node_data.get('pid', '')
+            if state_filter and state != state_filter:
+                return
+            pid_str = " pid {0}".format(pid) if pid else ""
+            self.ctl.output("{0}{1}{2:<20} {3:<12}{4}".format(prefix, connector, name, state, pid_str))
+        else:
+            # Group or MultiGroup
+            self.ctl.output("{0}{1}{2}".format(prefix, connector, name))
+        
+        # Prepare prefix for children
+        if is_last:
+            child_prefix = prefix + "   "
+        else:
+            child_prefix = prefix + "│  "
+        
+        # Display children
+        child_names = sorted(children.keys())
+        for i, child_name in enumerate(child_names):
+            child_data = children[child_name]
+            is_last_child = (i == len(child_names) - 1)
+            self._display_tree(child_data, child_prefix, is_last_child, depth, state_filter, current_depth + 1)
+
+    def help_groups(self):
+        self.ctl.output("groups\t\t\tShow hierarchical group structure")
+        self.ctl.output("groups --depth N\tLimit display depth")
+        self.ctl.output("groups --state STATE\tFilter by process state")  
+        self.ctl.output("groups --json\t\tOutput as JSON")
 
     def _startresult(self, result):
         name = make_namespec(result['group'], result['name'])
@@ -780,38 +957,59 @@ class DefaultControllerPlugin(ControllerPluginBase):
                 self.ctl.set_exitstatus_from_xmlrpc_fault(result['status'], xmlrpc.Faults.ALREADY_STARTED)
         else:
             for name in names:
-                group_name, process_name = split_namespec(name)
-                if process_name is None:
+                # Check if this is a hierarchical path (contains dots but no colon) or glob
+                if ('.' in name and ':' not in name) or '*' in name:
+                    # Try hierarchical control
                     try:
-                        results = supervisor.startProcessGroup(group_name)
+                        results = supervisor.controlByPath('start', [name])
                         for result in results:
-                            self.ctl.output(self._startresult(result))
-                            self.ctl.set_exitstatus_from_xmlrpc_fault(result['status'], xmlrpc.Faults.ALREADY_STARTED)
-                    except xmlrpclib.Fault as e:
-                        if e.faultCode == xmlrpc.Faults.BAD_NAME:
-                            error = "%s: ERROR (no such group)" % group_name
-                            self.ctl.output(error)
-                            self.ctl.exitstatus = LSBInitExitStatuses.INVALID_ARGS
-                        else:
-                            self.ctl.exitstatus = LSBInitExitStatuses.GENERIC
-                            raise
+                            if result.get('status') == 'success':
+                                self.ctl.output("{0}: started".format(result['path']))
+                            else:
+                                self.ctl.output("{0}: ERROR ({1})".format(result['path'], result.get('error', 'unknown error')))
+                                self.ctl.exitstatus = LSBInitExitStatuses.GENERIC
+                    except (AttributeError, xmlrpclib.Fault):
+                        # Fall back to traditional parsing
+                        self._start_traditional(supervisor, name)
                 else:
-                    try:
-                        result = supervisor.startProcess(name)
-                    except xmlrpclib.Fault as e:
-                        error = {'status': e.faultCode,
-                                  'name': process_name,
-                                  'group': group_name,
-                                  'description': e.faultString}
-                        self.ctl.output(self._startresult(error))
-                        self.ctl.set_exitstatus_from_xmlrpc_fault(error['status'], xmlrpc.Faults.ALREADY_STARTED)
-                    else:
-                        name = make_namespec(group_name, process_name)
-                        self.ctl.output('%s: started' % name)
+                    self._start_traditional(supervisor, name)
+
+    def _start_traditional(self, supervisor, name):
+        """Traditional start logic for backward compatibility."""
+        group_name, process_name = split_namespec(name)
+        if process_name is None:
+            try:
+                results = supervisor.startProcessGroup(group_name)
+                for result in results:
+                    self.ctl.output(self._startresult(result))
+                    self.ctl.set_exitstatus_from_xmlrpc_fault(result['status'], xmlrpc.Faults.ALREADY_STARTED)
+            except xmlrpclib.Fault as e:
+                if e.faultCode == xmlrpc.Faults.BAD_NAME:
+                    error = "%s: ERROR (no such group)" % group_name
+                    self.ctl.output(error)
+                    self.ctl.exitstatus = LSBInitExitStatuses.INVALID_ARGS
+                else:
+                    self.ctl.exitstatus = LSBInitExitStatuses.GENERIC
+                    raise
+        else:
+            try:
+                result = supervisor.startProcess(name)
+            except xmlrpclib.Fault as e:
+                error = {'status': e.faultCode,
+                          'name': process_name,
+                          'group': group_name,
+                          'description': e.faultString}
+                self.ctl.output(self._startresult(error))
+                self.ctl.set_exitstatus_from_xmlrpc_fault(error['status'], xmlrpc.Faults.ALREADY_STARTED)
+            else:
+                name_display = make_namespec(group_name, process_name)
+                self.ctl.output('%s: started' % name_display)
 
     def help_start(self):
         self.ctl.output("start <name>\t\tStart a process")
         self.ctl.output("start <gname>:*\t\tStart all processes in a group")
+        self.ctl.output("start <path>\t\tStart hierarchical group/program (e.g., prod.backend)")
+        self.ctl.output("start <glob>\t\tStart with glob patterns (e.g., frontend.*, prod.**)")
         self.ctl.output(
             "start <name> <name>\tStart multiple processes or groups")
         self.ctl.output("start all\t\tStart all processes")
@@ -857,38 +1055,59 @@ class DefaultControllerPlugin(ControllerPluginBase):
                 self.ctl.set_exitstatus_from_xmlrpc_fault(result['status'], xmlrpc.Faults.NOT_RUNNING)
         else:
             for name in names:
-                group_name, process_name = split_namespec(name)
-                if process_name is None:
+                # Check if this is a hierarchical path (contains dots but no colon) or glob
+                if ('.' in name and ':' not in name) or '*' in name:
+                    # Try hierarchical control
                     try:
-                        results = supervisor.stopProcessGroup(group_name)
-
+                        results = supervisor.controlByPath('stop', [name])
                         for result in results:
-                            self.ctl.output(self._stopresult(result))
-                            self.ctl.set_exitstatus_from_xmlrpc_fault(result['status'], xmlrpc.Faults.NOT_RUNNING)
-                    except xmlrpclib.Fault as e:
-                        self.ctl.exitstatus = LSBInitExitStatuses.GENERIC
-                        if e.faultCode == xmlrpc.Faults.BAD_NAME:
-                            error = "%s: ERROR (no such group)" % group_name
-                            self.ctl.output(error)
-                        else:
-                            raise
+                            if result.get('status') == 'success':
+                                self.ctl.output("{0}: stopped".format(result['path']))
+                            else:
+                                self.ctl.output("{0}: ERROR ({1})".format(result['path'], result.get('error', 'unknown error')))
+                                self.ctl.exitstatus = LSBInitExitStatuses.GENERIC
+                    except (AttributeError, xmlrpclib.Fault):
+                        # Fall back to traditional parsing
+                        self._stop_traditional(supervisor, name)
                 else:
-                    try:
-                        supervisor.stopProcess(name)
-                    except xmlrpclib.Fault as e:
-                        error = {'status': e.faultCode,
-                                 'name': process_name,
-                                 'group': group_name,
-                                 'description':e.faultString}
-                        self.ctl.output(self._stopresult(error))
-                        self.ctl.set_exitstatus_from_xmlrpc_fault(error['status'], xmlrpc.Faults.NOT_RUNNING)
-                    else:
-                        name = make_namespec(group_name, process_name)
-                        self.ctl.output('%s: stopped' % name)
+                    self._stop_traditional(supervisor, name)
+
+    def _stop_traditional(self, supervisor, name):
+        """Traditional stop logic for backward compatibility."""
+        group_name, process_name = split_namespec(name)
+        if process_name is None:
+            try:
+                results = supervisor.stopProcessGroup(group_name)
+
+                for result in results:
+                    self.ctl.output(self._stopresult(result))
+                    self.ctl.set_exitstatus_from_xmlrpc_fault(result['status'], xmlrpc.Faults.NOT_RUNNING)
+            except xmlrpclib.Fault as e:
+                self.ctl.exitstatus = LSBInitExitStatuses.GENERIC
+                if e.faultCode == xmlrpc.Faults.BAD_NAME:
+                    error = "%s: ERROR (no such group)" % group_name
+                    self.ctl.output(error)
+                else:
+                    raise
+        else:
+            try:
+                supervisor.stopProcess(name)
+            except xmlrpclib.Fault as e:
+                error = {'status': e.faultCode,
+                         'name': process_name,
+                         'group': group_name,
+                         'description':e.faultString}
+                self.ctl.output(self._stopresult(error))
+                self.ctl.set_exitstatus_from_xmlrpc_fault(error['status'], xmlrpc.Faults.NOT_RUNNING)
+            else:
+                name_display = make_namespec(group_name, process_name)
+                self.ctl.output('%s: stopped' % name_display)
 
     def help_stop(self):
         self.ctl.output("stop <name>\t\tStop a process")
         self.ctl.output("stop <gname>:*\t\tStop all processes in a group")
+        self.ctl.output("stop <path>\t\tStop hierarchical group/program (e.g., prod.backend)")
+        self.ctl.output("stop <glob>\t\tStop with glob patterns (e.g., frontend.*, prod.**)")
         self.ctl.output("stop <name> <name>\tStop multiple processes or groups")
         self.ctl.output("stop all\t\tStop all processes")
 
@@ -970,6 +1189,8 @@ class DefaultControllerPlugin(ControllerPluginBase):
     def help_restart(self):
         self.ctl.output("restart <name>\t\tRestart a process")
         self.ctl.output("restart <gname>:*\tRestart all processes in a group")
+        self.ctl.output("restart <path>\t\tRestart hierarchical group/program (e.g., prod.backend)")
+        self.ctl.output("restart <glob>\t\tRestart with glob patterns (e.g., frontend.*, prod.**)")
         self.ctl.output("restart <name> <name>\tRestart multiple processes or "
                      "groups")
         self.ctl.output("restart all\t\tRestart all processes")

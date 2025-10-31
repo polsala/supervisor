@@ -54,6 +54,7 @@ from supervisor import loggers
 from supervisor import states
 from supervisor import xmlrpc
 from supervisor import poller
+from supervisor import hierarchy
 
 def _read_version_txt():
     mydir = os.path.abspath(os.path.dirname(__file__))
@@ -490,6 +491,7 @@ class ServerOptions(Options):
                  "s", "silent", flag=1, default=0)
         self.pidhistory = {}
         self.process_group_configs = []
+        self.hierarchy_manager = None
         self.signal_receiver = SignalReceiver()
         self.poller = poller.Poller(self)
 
@@ -694,33 +696,73 @@ class ServerOptions(Options):
             kwargs['expansions'] = expansions
             return parser.saneget(section, opt, default, **kwargs)
 
-        # process heterogeneous groups
-        for section in all_sections:
-            if not section.startswith('group:'):
-                continue
-            group_name = process_or_group_name(section.split(':', 1)[1])
-            programs = list_of_strings(get(section, 'programs', None))
-            priority = integer(get(section, 'priority', 999))
-            group_processes = []
-            for program in programs:
-                program_section = "program:%s" % program
-                fcgi_section = "fcgi-program:%s" % program
-                if not program_section in all_sections and not fcgi_section in all_sections:
-                    raise ValueError(
-                        '[%s] names unknown program or fcgi-program %s' % (section, program))
-                if program_section in all_sections and fcgi_section in all_sections:
-                     raise ValueError(
-                        '[%s] name %s is ambiguous (exists as program and fcgi-program)' %
-                        (section, program))
-                section = program_section if program_section in all_sections else fcgi_section
-                homogeneous_exclude.append(section)
-                processes = self.processes_from_section(parser, section,
-                                                        group_name, ProcessConfig)
+        # Build hierarchical structure first
+        hierarchy_manager = hierarchy.HierarchyManager()
+        self._build_hierarchy_from_parser(parser, hierarchy_manager)
+        
+        # Store hierarchy manager for later use in supervisord
+        self.hierarchy_manager = hierarchy_manager
 
-                group_processes.extend(processes)
-            groups.append(
-                ProcessGroupConfig(self, group_name, priority, group_processes)
-                )
+        # process heterogeneous groups (traditional [group:name] and [multigroup:name])
+        for section in all_sections:
+            if not (section.startswith('group:') or section.startswith('multigroup:')):
+                continue
+                
+            section_type, full_name = section.split(':', 1)
+            group_name = process_or_group_name(full_name)
+            priority = integer(get(section, 'priority', 999))
+            
+            if section_type == 'group':
+                # Traditional group - handle both flat and dotted notation
+                programs = list_of_strings(get(section, 'programs', None))
+                group_processes = []
+                for program in programs:
+                    program_section = "program:%s" % program
+                    fcgi_section = "fcgi-program:%s" % program
+                    if not program_section in all_sections and not fcgi_section in all_sections:
+                        raise ValueError(
+                            '[%s] names unknown program or fcgi-program %s' % (section, program))
+                    if program_section in all_sections and fcgi_section in all_sections:
+                         raise ValueError(
+                            '[%s] name %s is ambiguous (exists as program and fcgi-program)' %
+                            (section, program))
+                    section_name = program_section if program_section in all_sections else fcgi_section
+                    homogeneous_exclude.append(section_name)
+                    processes = self.processes_from_section(parser, section_name,
+                                                            group_name, ProcessConfig)
+                    group_processes.extend(processes)
+                groups.append(
+                    ProcessGroupConfig(self, group_name, priority, group_processes)
+                    )
+            elif section_type == 'multigroup':
+                # Multigroup - get child groups and programs
+                child_groups = list_of_strings(get(section, 'groups', []))
+                child_programs = list_of_strings(get(section, 'programs', []))
+                
+                # Create ProcessGroupConfig for each program directly in the multigroup
+                group_processes = []
+                for program in child_programs:
+                    program_section = "program:%s" % program
+                    fcgi_section = "fcgi-program:%s" % program
+                    if not program_section in all_sections and not fcgi_section in all_sections:
+                        raise ValueError(
+                            '[%s] names unknown program or fcgi-program %s' % (section, program))
+                    if program_section in all_sections and fcgi_section in all_sections:
+                         raise ValueError(
+                            '[%s] name %s is ambiguous (exists as program and fcgi-program)' %
+                            (section, program))
+                    section_name = program_section if program_section in all_sections else fcgi_section
+                    homogeneous_exclude.append(section_name)
+                    processes = self.processes_from_section(parser, section_name,
+                                                            group_name, ProcessConfig)
+                    group_processes.extend(processes)
+                
+                if group_processes:
+                    groups.append(
+                        ProcessGroupConfig(self, group_name, priority, group_processes)
+                        )
+                
+                # Note: Child groups will be processed separately when their sections are encountered
 
         # process "normal" homogeneous groups
         for section in all_sections:
@@ -850,6 +892,78 @@ class ServerOptions(Options):
 
         groups.sort()
         return groups
+
+    def _build_hierarchy_from_parser(self, parser, hierarchy_manager):
+        """Build the hierarchical structure from configuration sections."""
+        all_sections = parser.sections()
+        
+        common_expansions = {'here': self.here}
+        def get(section, opt, default, **kwargs):
+            expansions = kwargs.get('expansions', {})
+            expansions.update(common_expansions)
+            kwargs['expansions'] = expansions
+            return parser.saneget(section, opt, default, **kwargs)
+        
+        # First pass: Create all programs
+        for section in all_sections:
+            if section.startswith('program:'):
+                program_name = process_or_group_name(section.split(':', 1)[1])
+                # For now, add programs at root level - they'll be moved to groups later
+                dummy_config = type('DummyConfig', (), {'name': program_name})()
+                hierarchy_manager.add_program(program_name, dummy_config)
+        
+        # Second pass: Process traditional groups [group:name] 
+        for section in all_sections:
+            if section.startswith('group:'):
+                full_name = section.split(':', 1)[1]
+                group_name = process_or_group_name(full_name)
+                
+                # Handle dotted notation for hierarchical groups
+                if '.' in group_name:
+                    # This creates a hierarchical structure
+                    hierarchy_manager.add_group(group_name, is_multigroup=False)
+                else:
+                    # Traditional flat group
+                    hierarchy_manager.add_group(group_name, is_multigroup=False)
+                
+                # Move programs into this group
+                programs = list_of_strings(get(section, 'programs', []))
+                for program in programs:
+                    # Remove program from root and add to this group
+                    try:
+                        root_program = hierarchy_manager.root.remove_child(program)
+                        if root_program:
+                            # Add to the group
+                            group_path = group_name if '.' not in group_name else group_name
+                            program_path = "%s.%s" % (group_path, program)
+                            hierarchy_manager.add_program(program_path, root_program.process_config)
+                    except Exception:
+                        # Program might already be in a different location
+                        pass
+        
+        # Third pass: Process multigroups [multigroup:name]
+        for section in all_sections:
+            if section.startswith('multigroup:'):
+                full_name = section.split(':', 1)[1]
+                group_name = process_or_group_name(full_name)
+                hierarchy_manager.add_group(group_name, is_multigroup=True)
+                
+                # Handle child programs directly in multigroup
+                programs = list_of_strings(get(section, 'programs', []))
+                for program in programs:
+                    try:
+                        root_program = hierarchy_manager.root.remove_child(program)
+                        if root_program:
+                            program_path = "%s.%s" % (group_name, program)
+                            hierarchy_manager.add_program(program_path, root_program.process_config)
+                    except Exception:
+                        pass
+        
+        # Validate the hierarchy
+        try:
+            hierarchy_manager.detect_cycles()
+        except hierarchy.CycleError as e:
+            raise ValueError(str(e))
 
     def parse_fcgi_socket(self, sock, proc_uid, socket_owner, socket_mode,
             socket_backlog):
